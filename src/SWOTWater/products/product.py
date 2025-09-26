@@ -1,0 +1,1023 @@
+"""
+Copyright (c) 2017-, California Institute of Technology ("Caltech"). U.S.
+Government sponsorship acknowledged.
+All rights reserved.
+
+Author (s): Dustin Lagoy
+
+"""
+from collections import OrderedDict as odict
+import copy
+import os
+import sys
+import warnings
+import logging
+import textwrap
+import contextlib
+import numpy as np
+import netCDF4 as nc
+
+import SWOTWater.products.netcdf as netcdf
+from SWOTWater.products.constants import FILL_VALUES
+
+LOGGER = logging.getLogger(__name__)
+
+FIELD_WARNING = "I'm afraid I can't do that. {} is not in {}"
+
+def textjoin(text):
+    """Dedent join and strip text"""
+    text = textwrap.dedent(text)
+    text = text.replace('\n', ' ')
+    text = text.strip()
+    return text
+
+def get_subclasses(cls):
+    """Recursively get dictionary of names/subclasses of class"""
+    products = {}
+    for product in cls.__subclasses__():
+        products[product.__name__] = product
+        products.update(get_subclasses(product))
+    return products
+
+def sort_variable_attribute_odict(in_odict):
+    """Sorts attributes"""
+    # These come first in this order
+    FIRST_ATTRS = ['dtype', 'dimensions', 'long_name', 'standard_name',
+                   'short_name', 'calendar', 'time', 'standard_time',
+                   'tai_utc_difference', 'leap_second']
+    # Then put in non-standard ones, and finally these ones in this order
+    LAST_ATTRS = [
+        'units', 'add_offset', 'scale_factor', 'quality_flag', 'flag_meanings',
+        'flag_masks', 'flag_values', 'valid_min', 'valid_max', 'coordinates',
+        'comment']
+
+    attr_list = []
+    for key in FIRST_ATTRS:
+        if key in in_odict:
+            attr_list.append([key, in_odict[key]])
+
+    for key in in_odict:
+        if key not in (FIRST_ATTRS+LAST_ATTRS):
+            attr_list.append([key, in_odict[key]])
+
+    for key in LAST_ATTRS:
+        if key in in_odict:
+            attr_list.append([key, in_odict[key]])
+    return odict(attr_list)
+
+
+class ProductTesterMixIn(object):
+    """Contains validation methods defined on product classes"""
+    def test_product(self, use_mask=False):
+        """Calls suite of validation tests"""
+        any_fail = False
+        for tester in [self.test_inf_nan, self.test_in_valid_range,
+                       self.test_qual_valid_max, self.test_qual_vs_flag_masks,
+                       self.test_group_attributes]:
+            try:
+                tester(use_mask=use_mask)
+            except AssertionError:
+                any_fail = True
+                continue
+
+        # Re-raise AssertionError if any test failed
+        if any_fail:
+            raise AssertionError
+
+    def test_group_attributes(self, prefix='', use_mask=False):
+        """
+        Checks that no group attributes listed have invalid/fill values.
+        This test only checks the attributes in the list. It may be
+        appropriate to add more group attributes if we are sure they should
+        never be populated with fill or NaN values.
+        """
+        any_fail = False
+        ATTRIBUTES_TO_TEST = ['geospatial_lon_min', 'geospatial_lon_max',
+                              'geospatial_lat_min', 'geospatial_lat_max']
+        for group in self.GROUPS:
+            try:
+                LOGGER.debug(
+                    'Testing group in test_group_attributes: %s'%group)
+                self[group].test_group_attributes(
+                    prefix=prefix+'/'+group+'/', use_mask=use_mask)
+            except AssertionError:
+                any_fail = True
+                continue
+
+        for attribute in self.ATTRIBUTES:
+            if attribute in ATTRIBUTES_TO_TEST:
+                value = self[attribute]
+                fill_value = self._getfill(attribute, is_attribute=True)
+                try:
+                    assert np.logical_and(value != fill_value,
+                                          ~np.isnan(value))
+                except AssertionError:
+                    any_fail = True
+                    # stdout will be printed on assertion failure
+                    # Just the first offending value is printed here
+                    if self.ATTRIBUTES[attribute]['dtype'] == 'c8':
+                        LOGGER.warning((
+                            'TEST FAILURE in test_group_attributes: '
+                            '%s failed; %f %f')%(
+                                prefix+attribute, value.real, value.imag))
+                    elif self.ATTRIBUTES[attribute]['dtype'][0] in ['i', 'u']:
+                        LOGGER.warning((
+                            'TEST FAILURE in test_group_attributes: '
+                            '%s failed; %d')%(prefix+attribute, value))
+                    else:
+                        LOGGER.warning((
+                            'TEST FAILURE in test_group_attributes: '
+                            '%s failed; %f')%(
+                                prefix+attribute, value))
+
+        # Re-raise AssertionError if any failed the test
+        if any_fail:
+            raise AssertionError
+
+
+    def test_qual_vs_flag_masks(self, prefix='', use_mask=False):
+        """
+        Checks that quality flags have no bits set that are not in flag_masks
+        """
+        any_fail = False
+        for group in self.GROUPS:
+            try:
+                LOGGER.debug(
+                    'Testing group in test_qual_vs_flag_masks: %s'%group)
+                self[group].test_qual_vs_flag_masks(
+                    prefix=prefix+'/'+group+'/', use_mask=use_mask)
+            except AssertionError:
+                any_fail = True
+                continue
+
+        for var in self.VARIABLES:
+            if('flag_meanings' in self.VARIABLES[var] and
+               'flag_masks' in self.VARIABLES[var]):
+
+                flag_masks = self.VARIABLES[var]['flag_masks']
+
+                values = self[var]
+                if np.ma.isMaskedArray(values):
+                    if use_mask:
+                        values = values.data[~values.mask]
+                    else:
+                        values = values.data
+
+                # Iterate over values, print first value to fail and break
+                sum_flag_masks = np.bitwise_or.reduce(flag_masks)
+                mask_invalid = values & ~sum_flag_masks > 0
+                try:
+                    assert (~mask_invalid).all()
+                except AssertionError:
+                    any_fail = True
+                    # stdout will be printed on assertion failure
+                    # Just the first offending value is printed here
+                    LOGGER.warning((
+                        'TEST FAILURE in test_qual_vs_flag_masks: '
+                        '%s failed; %d %d')%(
+                            prefix+var, values[mask_invalid][0], sum_flag_masks))
+
+        # Re-raise AssertionError if any failed the test
+        if any_fail:
+            raise AssertionError
+
+    def test_qual_valid_max(self, prefix='', use_mask=False):
+        """Checks that quality flags have correct valid_max"""
+        # Note use_mask has no action in this method (it is there for a common
+        # interface to test_* methods)
+        any_fail = False
+        for group in self.GROUPS:
+            try:
+                LOGGER.debug('Testing group in test_qual_valid_max: %s'%group)
+                self[group].test_qual_valid_max(
+                    prefix=prefix+'/'+group+'/', use_mask=use_mask)
+            except AssertionError:
+                any_fail = True
+                continue
+
+        for var in self.VARIABLES:
+            if('flag_meanings' in self.VARIABLES[var] and
+               'flag_masks' in self.VARIABLES[var]):
+                try:
+                    valid_max = self.VARIABLES[var]['valid_max']
+                    flag_masks = self.VARIABLES[var]['flag_masks']
+                    sum_flag_masks = np.bitwise_or.reduce(flag_masks)
+                    assert valid_max == sum_flag_masks
+                except AssertionError:
+                    any_fail = True
+                    LOGGER.warning(
+                        ('TEST FAILURE in test_qual_valid_max: %s %d '
+                         'expected %d'%(prefix+var, valid_max, sum_flag_masks)))
+
+        # Re-raise AssertionError if any failed the test
+        if any_fail:
+            raise AssertionError
+
+    def test_inf_nan(self, prefix='', use_mask=False):
+        """Checks for non-finite values in floating point rivertile outputs"""
+        any_fail = False
+        for group in self.GROUPS:
+            try:
+                LOGGER.debug('Testing group in test_inf_nan: %s'%group)
+                self[group].test_inf_nan(
+                    prefix=prefix+'/'+group+'/', use_mask=use_mask)
+            except AssertionError:
+                any_fail = True
+                continue
+
+        for var in self.VARIABLES:
+            # just test floating point types
+            if self.VARIABLES[var]['dtype'][0] not in ['f',]:
+                continue
+
+            # Don't need to reject fill values here (they are finite)
+            values = self[var]
+            if np.ma.isMaskedArray(values):
+                if use_mask:
+                    values = values.data[~values.mask]
+                else:
+                    values = values.data
+
+            try:
+                assert np.isfinite(values).all()
+            except AssertionError:
+                any_fail = True
+                LOGGER.warning(
+                    'TEST FAILURE in test_inf_nan: %s'%(prefix+var))
+            except TypeError:
+                # raised if time_str
+                continue
+
+        # Re-raise AssertionError if any failed the test
+        if any_fail:
+            raise AssertionError
+
+    def test_in_valid_range(self, prefix='', use_mask=False):
+        """Checks that all variables are within the valid range"""
+        any_fail = False
+        for group in self.GROUPS:
+            try:
+                LOGGER.debug('Testing group in test_in_valid_range: %s'%group)
+                self[group].test_in_valid_range(
+                    prefix=prefix+'/'+group+'/', use_mask=use_mask)
+            except AssertionError:
+                any_fail = True
+                continue
+
+        for var in self.VARIABLES:
+            # If variable lacks valid_min/max skip it
+            with contextlib.suppress(KeyError):
+                valid_min = self.VARIABLES[var]['valid_min']
+                valid_max = self.VARIABLES[var]['valid_max']
+                fill_value = self._getfill(var)
+
+                # Reject fill values before assertion
+                values = self[var]
+                if np.ma.isMaskedArray(values):
+                    if use_mask:
+                        values = values.data[~values.mask]
+                    else:
+                        values = values.data
+                values = values[values != fill_value]
+
+                mask_invalid = np.logical_not(np.logical_and(
+                    values >= valid_min, values <= valid_max))
+
+                try:
+                    assert (~mask_invalid).all()
+                except AssertionError:
+                    any_fail = True
+                    # stdout will be printed on assertion failure
+                    # Just the first offending value is printed here
+                    value = values[mask_invalid][0]
+                    if self.VARIABLES[var]['dtype'] == 'c8':
+                        LOGGER.warning((
+                            'TEST FAILURE in test_in_valid_range: '
+                            '%s failed; %f %f %f %f')%(
+                                prefix+var, value.real, value.imag, valid_min,
+                                valid_max))
+                    elif self.VARIABLES[var]['dtype'][0] in ['i', 'u']:
+                        LOGGER.warning((
+                            'TEST FAILURE in test_in_valid_range: '
+                            '%s failed; %d %d %d')%(
+                                prefix+var, value, valid_min, valid_max))
+                    else:
+                        LOGGER.warning((
+                            'TEST FAILURE in test_in_valid_range: '
+                            '%s failed; %f %f %f')%(
+                                prefix+var, value, valid_min, valid_max))
+
+        # Re-raise AssertionError if any failed the test
+        if any_fail:
+            raise AssertionError
+
+
+class Product(object):
+    """Base class for SWOT-like data products.
+
+    These are basically NetCDF files."""
+    # These hold forms of what is allowed to exist in this product
+    ATTRIBUTES = odict()
+    DIMENSIONS = odict()
+    VARIABLES = odict()
+    GROUPS = odict()
+    DEFAULT_COMPLEVEL = None
+    ATTRS = [
+        'ATTRIBUTES', 'DIMENSIONS', 'VARIABLES', 'GROUPS', '_attributes',
+        '_variables', '_groups', 'DEFAULT_COMPLEVEL']
+
+    def __init__(self):
+        # These hold what actually exists in memory
+        self._attributes = odict()
+        self._variables = odict()
+        self._groups = odict()
+        # reorder the attributes of the variables to the blessed order
+        for key, attr_odict in self.VARIABLES.items():
+            self.VARIABLES[key] = copy.deepcopy(
+                sort_variable_attribute_odict(attr_odict))
+        # For bug finding
+        assert isinstance(self.ATTRIBUTES, odict)
+        assert isinstance(self.DIMENSIONS, odict)
+        assert isinstance(self.VARIABLES, odict)
+        assert isinstance(self.GROUPS, odict)
+
+    @classmethod
+    def get_product(cls, name):
+        """Get a product (any subclass of Product()) by it's class name"""
+        subclasses = get_subclasses(Product)
+        return subclasses[name]
+
+    @property
+    def attributes(self):
+        dictionary = copy.deepcopy(self._attributes)
+        return dictionary
+
+    @property
+    def variables(self):
+        return odict(
+            (key, variable) for key, variable in self._variables.items())
+
+    @property
+    def dimensions(self):
+        """A dictionary of dimensions and their sizes"""
+        # Get default values from DIMENSIONS
+        dimensions = odict(
+            (key, value) for key, value in self.DIMENSIONS.items())
+        # Update with any initialied values
+        for key, variable in self.VARIABLES.items():
+            for i, vdim in enumerate(variable['dimensions']):
+                assert vdim in dimensions, vdim+", "+str(list(dimensions.keys()))
+                if key in self.variables:
+                    dimensions[vdim] = self[key].shape[i]
+        return dimensions
+
+    @property
+    def full_attributes(self):
+        dictionary = self.attributes
+        dictionary.update(self.dimensions)
+        return dictionary
+
+    def copy_attributes(self, other_product, nowarn=False):
+        """Copy the attributes of given product into this one"""
+        for key, value in other_product.attributes.items():
+            # If nowarn, suppress Warnings if key not in self
+            if key in self.ATTRIBUTES.keys() or not nowarn:
+                self[key] = value
+
+    def copy(self, **kwargs):
+        """Return a deep copy of self, optionally without variable data."""
+        # Make a new blank object of this type
+        new_product = type(self)()
+        # Copy it
+        self._copy(new_product, **kwargs)
+        return new_product
+
+    def append(self, product):
+        """Return a copy of self with values in product appended"""
+        new_product = self.copy(with_variables=False)
+        for key, value in self._groups.items():
+            new_product[key] = value.append(product[key])
+        for key, variable in self._variables.items():
+            if variable is not None:
+                new_product[key] = np.append(variable, product[key], axis=0)
+        return new_product
+
+    def _copy(self, new_product, with_variables=True):
+        # Copy all of self into new_product
+        for key, value in self._attributes.items():
+            new_product[key] = value
+        for key, value in self._groups.items():
+            #print('copy group', key)
+            new_product[key] = value.copy(with_variables=with_variables)
+        if with_variables:
+            for key, variable in self._variables.items():
+                if variable is not None:
+                    new_product[key] = copy.deepcopy(variable)
+
+    def _copy_from(self, product, with_variables=True):
+        # Copy all of self into new_product
+        for key in self.ATTRIBUTES:
+            self[key] = product[key]
+        if with_variables:
+            for key in self.VARIABLES:
+                self[key] = copy.deepcopy(product[key])
+        for key in self.GROUPS:
+            print('copy group', key)
+            self[key] = self[key]._copy_from(with_variables=with_variables)
+
+    # Override built in functions so calling Product.name or Product['name']
+    # return the attribute or variable. We assume attributes and variables have
+    # different names.
+    def __setattr__(self, key, item):
+        if key in self.ATTRS:
+            # Allow __init__ to set self up properly
+            super(Product, self).__setattr__(key, item)
+            return
+        if isinstance(item, Product):
+            if key in self.GROUPS:
+                self._groups[key] = item
+                return
+        if isinstance(item, np.ndarray):
+            # Try to set the variable
+            if key in self.VARIABLES:
+                form = self.VARIABLES[key]
+                # Check the incoming item dimensions against the
+                # product-variable ones
+                assert len(item.shape) == len(form['dimensions'])
+                # Check the product-variable dimensions against the
+                # product-global ones
+                for i, dimension in enumerate(form['dimensions']):
+                    if self.dimensions[dimension] != 0:
+                        # Only check if this dimension is already initialized
+                        assert self.dimensions[dimension] == item.shape[i]
+                self._variables[key] = item
+                return
+        if key in self.ATTRIBUTES:
+            self._attributes[key] = item
+            return
+        # We couldn't set anything!
+        warnings.warn(FIELD_WARNING.format(key, type(self).__name__))
+
+    def __getattr__(self, key):
+        if key in self._attributes:
+            return self._attributes[key]
+        if key in self._variables:
+            return self._variables[key]
+        if key in self._groups:
+            return self._groups[key]
+        # Nothing in memory, return empty data
+        if key in self.ATTRIBUTES:
+            return self.ATTRIBUTES[key].get('value', 'None')
+        if key in self.VARIABLES:
+            shape = []
+            for dimension in self.VARIABLES[key]['dimensions']:
+                shape.append(self.dimensions[dimension])
+            dtype = self.VARIABLES[key].get('dtype', np.float32)
+            quantized_fill = self._getfill(key)
+            value = np.ones(shape, dtype=dtype)
+            if not value.shape==():
+                value[:] = quantized_fill
+            return np.ma.masked_array(
+                data=value, dtype=dtype, fill_value=quantized_fill,
+                mask=np.ones(shape))
+        if key in self.GROUPS:
+            self[key] = self.get_product(self.GROUPS[key])()
+            return self[key]
+        raise AttributeError('{} not in product'.format(key))
+
+    @classmethod
+    def _getfill(cls, name, dtype=None, is_attribute=False):
+        """Returns fill value from cls.VARIABLES or FILL_VALUES"""
+        data_dict = cls.VARIABLES
+        default_dtype = 'f4'
+        if is_attribute:
+            data_dict = cls.ATTRIBUTES
+            default_dtype = 'str'
+        try:
+            fill = data_dict[name]['_FillValue']
+        except KeyError:
+            if dtype is None:
+                if 'dtype' in data_dict[name]:
+                    dtype = data_dict[name]['dtype']
+                else:
+                    dtype = default_dtype
+            dtype_str = np.dtype(dtype).str[1:]
+            if (dtype_str[0] == 'S') or (dtype_str[0] == 'U') or (
+                    dtype_str[0]=='O'):
+                # handle arbitrary-size strings
+                dtype_str = 'S1'
+            fill = FILL_VALUES[dtype_str]
+        return fill
+
+    def __setitem__(self, key, item):
+        return setattr(self, key, item)
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def _casted_variable(self, key):
+        variable = self[key]
+        if 'dtype' in self.VARIABLES[key]:
+            dtype = self.VARIABLES[key]['dtype']
+        else:
+            dtype = variable.dtype
+        if isinstance(variable, np.ma.MaskedArray):
+            mask = variable.mask
+        else:
+            mask = False
+        quantized_fill = self._getfill(key, dtype)
+        return np.ma.masked_array(
+            data=variable.astype(dtype), dtype=dtype,
+            fill_value=quantized_fill, mask=mask)
+
+    def to_ncfile(self, filename):
+        """Write self to a netCDF file."""
+        default_complevel = getattr(self, 'DEFAULT_COMPLEVEL', None)
+        dataset = nc.Dataset(filename, 'w')
+        self.to_dataset(dataset, default_complevel=default_complevel)
+        dataset.sync()
+        dataset.close()
+
+    def to_folder(self, folder):
+        """Store self in a folder on disk.
+
+        Will recursively store groups in self in subfolders."""
+        os.mkdir(folder)
+        for key, value in self._groups.items():
+            subfolder = os.path.join(folder, key)
+            value.to_folder(subfolder)
+        with open(os.path.join(folder, 'attributes.txt'), 'w') as pointer:
+            for key, value in self._attributes.items():
+                try:
+                    pointer.write('{} = {:.17g}\n'.format(key, value))
+                except ValueError:
+                    pointer.write('{} = {}\n'.format(key, value))
+        with open(os.path.join(folder, 'variables.txt'), 'w') as pointer:
+            for key, value in self.dimensions.items():
+                pointer.write('{} = {:.17g}\n'.format(key, value))
+            for key, value in self._variables.items():
+                pointer.write('{}: {}\n'.format(key, value.dtype.str))
+        for key, variable in self._variables.items():
+            if variable is None:
+                continue
+            if variable.ndim == 1:
+                np.savetxt(os.path.join(folder, key), variable)
+            else:
+                variable.data.tofile(os.path.join(folder, key))
+
+    def to_dataset(self, dataset, default_complevel=None):
+        """Store self in a NetCDF dataset/group.
+
+        Will recursively store groups in self under dataset."""
+        for key in self.GROUPS:
+            netcdf_group = dataset.createGroup(key)
+            # Recursively add the group members
+            self[key].to_dataset(
+                netcdf_group, default_complevel=default_complevel)
+        for key in self.ATTRIBUTES:
+            value = self[key]
+            if value is None:
+                value = ''
+            try:
+                dtype = self.ATTRIBUTES[key]['dtype']
+                if dtype != 'str':
+                    try:
+                        value = np.dtype(dtype).type(value)
+                    except ValueError:
+                        warnings.warn((
+                            "Unable to cast key: {}; value: {}; as dtype: "+
+                            "{}.").format(key, value, dtype))
+            except (TypeError, KeyError):
+                # if self.ATTRIBUTES is list or dtype not in self.ATTRIBUTES
+                pass
+            dataset.setncattr(key, value)
+        for key, value in self.dimensions.items():
+            dataset.createDimension(key, value)
+        for key in self.VARIABLES:
+            form = self.VARIABLES[key]
+            # Cast the variable to the correct type/fill value
+            variable = self._casted_variable(key)
+            # Use a helper function to deal with complex numbers
+            netcdf.set_variable(
+                dataset, key, variable, list(form['dimensions']),
+                attributes=form, default_complevel=default_complevel)
+
+    def get_biggest_var(self):
+        var_names = [key for key, attr in self.VARIABLES.items()
+                     if hasattr(self[key], 'nbytes')]
+        var_sizes = [self[key].nbytes for key in var_names]
+        biggest = max(zip(var_sizes, var_names))
+        return biggest[1], biggest[0]
+
+    @classmethod
+    def from_ncfile(cls, filename, variables=None):
+        """Generate a product directly from a NetCDF file.
+
+        By default, will only read values defined in this Product.
+
+        If 'force' is True, will read any attribute/variable/dimension, even if
+        they are not defined in this Product
+
+        If 'variables' is given, will load only those variables with names in
+        the list.
+        """
+        dataset = nc.Dataset(filename, 'r')
+        product = cls()
+        product.from_dataset(dataset, variables)
+        dataset.close()
+        return product
+
+
+    def from_dataset(self, dataset, variables=None):
+        """Load self from a NetCDF dataset/group.
+
+        Will recursively load groups in dataset into self._groups."""
+        for key in dataset.ncattrs():
+            if key in self.ATTRIBUTES:
+                setattr(self, key, dataset.getncattr(key))
+            else:
+                warnings.warn(FIELD_WARNING.format(key, type(self).__name__))
+
+        for key in netcdf.get_variable_keys(dataset):
+            if key in self.VARIABLES:
+                # Use a helper function to deal with complex numbers
+                variable = netcdf.get_variable(dataset, key)
+                setattr(self, key, variable)
+            else:
+                warnings.warn(FIELD_WARNING.format(key, type(self).__name__))
+
+        for key, group in dataset.groups.items():
+            if key in self.GROUPS:
+                # Recursively load NetCDF groups into self groups
+                class_name = self.GROUPS[key]
+                cls = self.get_product(class_name)()
+                self[key] = cls
+                self[key].from_dataset(dataset[key], variables)
+            else:
+                raise ValueError('{} not in product'.format(key))
+
+    @classmethod
+    def print_xml(cls, prefix=None, ofp=sys.stdout, shape_names=[],
+                  shape_dims={}, is_shapefile=False, keys_to_drop=[]):
+        """Prints the XML for this data product"""
+        def remap_type(dtype):
+            return
+
+        klass = cls()
+
+        INDENT = 2*' '
+        if prefix is None:
+            try:
+                uid = klass.UID
+            except AttributeError:
+                uid = klass.__class__.__name__
+
+            ofp.write(INDENT+'<product>\n')
+            ofp.write(2*INDENT+'<science uid="%s">\n'% uid)
+            ofp.write(3*INDENT+'<nodes>\n')
+
+        for group in klass.GROUPS:
+            if prefix is None:
+                next_prefix = group
+            else:
+                next_prefix = '%s/%s' % (prefix, group)
+
+            klass.get_product(klass.GROUPS[group]).print_xml(
+                    prefix=next_prefix, ofp=ofp, shape_names=shape_names,
+                    shape_dims=shape_dims, is_shapefile=is_shapefile,
+                    keys_to_drop=keys_to_drop)
+
+        for dset in klass.VARIABLES:
+            if dset in keys_to_drop:
+                continue
+
+            attrs = copy.deepcopy(klass.VARIABLES[dset])
+            # get dtype str representation from instance of number
+            try:
+                type_str = np.dtype(attrs.pop('dtype')).str
+            except KeyError:
+                type_str = '<f4'
+
+            # _FillValue special handling
+            attrs["_FillValue"] = klass._getfill(dset)
+            attrs.move_to_end("_FillValue", last=False)
+
+            # hacks for river sp shapefile XMLs
+            if is_shapefile:
+
+                # skip these ones
+                if dset in ['centerline_lon', 'centerline_lat', 'lat_prior',
+                            'lon_prior']:
+                    continue
+
+                if dset in ['reach_id', 'node_id', 'rch_id_dn',
+                            'rch_id_up', 'time_str', 't_str_avg', 't_str_hmin',
+                            't_str_hmax', 't_str_hmed']:
+                    attrs['type'] = 'text'
+                    if dset in ['reach_id', 'node_id']:
+                        attrs.pop("_FillValue", None)
+                    else:
+                        attrs["fill_value"] = "no_data"
+                        attrs.move_to_end("fill_value", last=False)
+                        attrs.pop("_FillValue", None)
+                else:
+                    attrs["fill_value"] = klass._getfill(dset)
+                    attrs.move_to_end("fill_value", last=False)
+                    attrs.pop("_FillValue", None)
+
+                    # decide if 'text', 'float', 'int4', or 'int9'
+                    if type_str[1] == 'f':
+                        attrs['type'] = 'float'
+                    elif (type_str[1] == 'i' or type_str[1] == 'u'):
+                        # hack based on fill value!
+                        if attrs['fill_value'] == -999:
+                            attrs['type'] = 'int4'
+                        else:
+                            attrs['type'] = 'int9'
+                    else:
+                        attrs['type'] = 'text'
+                attrs.move_to_end('type', last=False)
+
+            if type_str[1] == 'c':
+                type_str = type_str[0] + 'f{}'.format(int(int(type_str[2:])/2))
+                attrs['dimensions']['complex_depth'] = 2
+
+            # XML wdith value
+            width = int(type_str[2]) * 8
+
+            # XML shape value
+            shape_name = "_".join(attrs['dimensions'])+"_shape"
+
+            dims = attrs['dimensions']
+            if prefix is not None:
+                shape_name = "{}_{}".format(prefix, shape_name)
+                dims = odict(
+                    ('/{}/{}'.format(prefix, key), value) for key, value in
+                    attrs['dimensions'].items())
+
+            if shape_name not in shape_names:
+                shape_names.append(shape_name)
+                shape_dims[shape_name] = dims
+
+            # Don't write out dimensions
+            attrs.pop('dimensions', None)
+
+            # XML node name
+            dset_name = '/'+dset if prefix is None else '/%s/%s' % (prefix, dset)
+
+            for name, value in attrs.items():
+                if np.iscomplexobj(value):
+                    attrs[name] = value.real
+
+            things = []
+            for key, value in attrs.items():
+                # explicitly use floats for add_offset and scale_factor
+                if key in ['add_offset', 'scale_factor']:
+                    things.append('%s="%f" ' % (key, value))
+                elif key in ['flag_values', 'flag_masks']:
+                    things.append('{}="{}"'.format(
+                        key, ' '.join(['{}'.format(item) for item in value])))
+                else:
+                    things.append('{}="{}"'.format(key, value))
+            annotations = ' '.join(things)
+
+            # for floats
+            if type_str[1] == 'f':
+                string = '\n'.join([
+                    4*INDENT+'<real name="%s" shape="%s" width="%d">' % (
+                        dset_name, shape_name, width),
+                    5*INDENT+'<annotation app="conformance" %s/>' % annotations,
+                    4*INDENT+'</real>\n'])
+
+            # for integers
+            elif type_str[1] == 'i' or type_str[1] == 'u':
+                signed_str = 'true' if type_str[1] == 'i' else 'false'
+                string = '\n'.join([
+                    4*INDENT+'<integer name="%s" shape="%s" width="%d" signed="%s">' % (
+                        dset_name, shape_name, width, signed_str),
+                    5*INDENT+'<annotation app="conformance" %s/>' % annotations,
+                    4*INDENT+'</integer>\n'])
+
+            elif type_str[1:3] == 'S1':
+                width = int(type_str[2])
+                string = '\n'.join([
+                    4*INDENT+'<char name="%s" shape="%s" width="%d">' % (
+                        dset_name, shape_name, width),
+                    5*INDENT+'<annotation app="conformance" %s/>' % annotations,
+                    4*INDENT+'</char>\n'])
+
+            elif type_str[1] in ('S', 'U'):
+                width = int(type_str[2])
+                string = '\n'.join([
+                    4*INDENT+'<string name="%s" shape="%s" width="%d">' % (
+                        dset_name, shape_name, width),
+                    5*INDENT+'<annotation app="conformance" %s/>' % annotations,
+                    4*INDENT+'</string>\n'])
+
+            else:
+                raise TypeError("Only ints, floats, strings supported so far!")
+
+            ofp.write(string)
+
+        # add attributes
+        for attr, attr_value in klass.ATTRIBUTES.items():
+            if attr in keys_to_drop:
+                continue
+
+            attr_node = (
+                '/@'+attr if prefix is None else '/%s/@%s' % (prefix, attr))
+
+            # get the dtype and doc string
+            type_str = np.dtype(attr_value['dtype']).str
+            width = int(type_str[2]) * 8
+
+            annotation_desc_string = (
+                '<annotation description="%s"/>' % attr_value['docstr']
+                if 'docstr' in attr_value else None)
+
+            strings = []
+            if type_str[1] == 'f':
+                strings += [
+                    4*INDENT+'<real name="%s" shape="Scalar" width="%d">' %(
+                    attr_node, width),]
+                if annotation_desc_string is not None:
+                    strings += [5*INDENT+annotation_desc_string,]
+                strings += [4*INDENT+'</real>',]
+
+            elif type_str[1] == 'i' or type_str[1] == 'u':
+                signed_str = 'true' if type_str[1] == 'i' else 'false'
+                strings += [
+                    4*INDENT+'<integer name="%s" shape="Scalar" width="%d" signed="%s">' %(
+                    attr_node, width, signed_str),]
+                if annotation_desc_string is not None:
+                    strings += [5*INDENT+annotation_desc_string,]
+                strings += [4*INDENT+'</integer>',]
+
+            elif type_str == 'str' or type_str[1] == 'U':
+                strings += [
+                    4*INDENT+'<string name="%s" shape="Scalar" width="%d">' %(
+                    attr_node, width/8),]
+                if annotation_desc_string is not None:
+                    strings += [5*INDENT+annotation_desc_string,]
+                strings += [4*INDENT+'</string>',]
+            else:
+                raise TypeError("Only ints, floats, strings supported so far!")
+
+            ofp.write('\n'.join(strings)+'\n')
+
+        if prefix is None:
+            ofp.write(3*INDENT+'</nodes>\n')
+            ofp.write(2*INDENT+'</science>\n')
+            ofp.write(2*INDENT+'<shape name="Scalar" order="irrelevant"/>')
+
+            # write out all the dimension shapes
+            for shape_name in shape_names:
+                string = (2*INDENT +
+                    '<shape name="%s" order="slowest...fastest">\n'%shape_name)
+                ofp.write(string)
+
+                dims = shape_dims[shape_name]
+                for key, value in shape_dims[shape_name].items():
+                    string = 3*INDENT+'<dimension extent="%s" name="%s"/>\n' % (
+                        value, key)
+                    ofp.write(string)
+                ofp.write(2*INDENT+"</shape>\n")
+            ofp.write(INDENT+"</product>\n")
+
+    def quantize_from(self, my_var, value):
+        """
+        Sets self[my_var] as the quantized data in data according to
+        self.VARIABLES[my_var] scale_factor and dtype
+        """
+        dtype = self.VARIABLES[my_var]['dtype']
+        scale_factor = self.VARIABLES[my_var].get('scale_factor', 1)
+        add_offset = self.VARIABLES[my_var].get('add_offset', 0)
+        quantized_fill = self._getfill(my_var)
+        fill = FILL_VALUES[value.dtype.str[1:]]
+
+        if np.ma.isMaskedArray(value):
+            # if mask array use .data
+            valid = np.logical_and(value.data != fill, np.isfinite(value))
+        else:
+            valid = np.logical_and(value != fill, np.isfinite(value))
+
+        quantized_values = quantized_fill * np.ones(value.shape)
+        if dtype[0] in ['i', 'u']:
+            # round integers to nearest int versus just typecast
+            quantized_values[valid] = np.round(
+                (value[valid]-add_offset) / scale_factor).astype(dtype)
+        else:
+            quantized_values[valid] = (
+                (value[valid]-add_offset) / scale_factor).astype(dtype)
+
+        out_value = np.ma.masked_array(
+            data=quantized_values, dtype=dtype, fill_value=quantized_fill,
+            mask=np.logical_not(valid))
+
+        self[my_var] = out_value
+
+    def requantize(self):
+        """Calls quantize_from on all variables that are quantized"""
+        for group in self.GROUPS:
+            self[group].requantize()
+        for var in self.VARIABLES:
+            scale_factor = self.VARIABLES[var].get('scale_factor', 1)
+            if scale_factor != 1:
+                self.quantize_from(var, self[var])
+
+    def cast(self):
+        for group in self.GROUPS:
+            self[group].cast()
+        for key in self.variables:
+            self[key] = self._casted_variable(key)
+
+    def reset_valid_minmax(self):
+        """open up valid data range to whole range of datatype"""
+        print ('resetting valid min/max range')
+        for group in self.GROUPS:
+            print('group: ', group)
+            self[group].reset_valid_minmax()
+
+        for key, variable in self.VARIABLES.items():
+            if variable is not None:
+                print ('variable: ', key)
+                try:
+                    info = np.iinfo(variable['dtype'])
+                except ValueError:
+                    info = np.finfo(variable['dtype'])
+                variable['valid_min'] = info.min
+                variable['valid_max'] = info.max
+
+class MutableProduct(Product):
+    """A product with forms as instance attributes, not class attributes
+
+    Can be initialized with attributes, dimensions, etc. If arguments are just
+    lists:
+        dimensions are assumed to be 0
+        variables are assumed to have all dimensions
+        groups are assumed to be MutableProduct()s
+    """
+    def __init__(
+            self, attributes=None, dimensions=None, variables=None,
+            groups=None):
+        super().__init__()
+        # Override these with instance attributes, so they can be specific to
+        # this instance
+        self.ATTRIBUTES = []
+        self.DIMENSIONS = odict()
+        self.VARIABLES = odict()
+        self.GROUPS = odict()
+        # Set whatever has been given
+        if attributes is not None:
+            self.ATTRIBUTES.extend(attributes)
+        if isinstance(dimensions, list):
+            self.DIMENSIONS.update([[name, 0] for name in dimensions])
+        elif isinstance(dimensions, dict):
+            self.DIMENSIONS.update(dimensions)
+        if isinstance(variables, list):
+            self.VARIABLES.update([[name, odict()] for name in variables])
+            for name, form in self.VARIABLES.items():
+                form['dimensions'] = self.DIMENSIONS
+        elif isinstance(variables, dict):
+            self.VARIABLES.update(variables)
+        if isinstance(groups, list):
+            self.GROUPS.update([[name, 'MutableProduct'] for name in groups])
+        elif isinstance(groups, dict):
+            self.GROUPS.update(groups)
+
+    def from_dataset(self, dataset, variables=None):
+        """Just like Product()'s version, but set self's forms from the file"""
+        self._form_from_dataset(dataset)
+        super().from_dataset(dataset, variables)
+
+    def _form_from_dataset(self, dataset):
+        """Make a MutableProduct with forms set from dataset"""
+        for key in dataset.ncattrs():
+            self.ATTRIBUTES.append(key)
+        for key in netcdf.get_variable_keys(dataset):
+            variable = netcdf.get_variable(dataset, key)
+            variable_dimensions = netcdf.get_variable_dimensions(
+                dataset, key)
+            dimensions = odict()
+            for i, dimension in enumerate(variable_dimensions):
+                dimensions[dimension] = variable.shape[i]
+            self.VARIABLES[key] = odict([
+                ['dtype', variable.dtype],
+                ['dimensions', odict(
+                    [[dimension, 0] for dimension in variable_dimensions])],
+            ])
+            for attribute in dataset[key].ncattrs():
+                self.VARIABLES[key][attribute] = dataset[key].getncattr(
+                    attribute)
+            for dimension in variable_dimensions:
+                if dimension not in self.DIMENSIONS:
+                    self.DIMENSIONS[dimension] = 0
+        for key in dataset.groups:
+            self.GROUPS[key] = 'MutableProduct'
+
+    def _copy(self, new_product, with_variables=True):
+        new_product.ATTRIBUTES = self.ATTRIBUTES
+        new_product.DIMENSIONS = self.DIMENSIONS
+        new_product.VARIABLES = self.VARIABLES
+        new_product.GROUPS = self.GROUPS
+        super()._copy(new_product, with_variables)
