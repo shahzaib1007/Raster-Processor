@@ -94,7 +94,7 @@ class GeolocRaster():
     def taylor_improved_geoloc(self):
         """ Improve the height of noisy point (in object sensor) """
         LOGGER.info("doing taylor improved geolocation")
-
+        LOGGER.info('No swath side correction applied yet!')
         # Init output vectors
         self.out_lat_corr = np.ma.masked_all(
             len(self.pixc['pixel_cloud']['latitude']))
